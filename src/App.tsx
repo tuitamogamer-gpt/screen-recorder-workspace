@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import type { CSSProperties, ReactNode } from "react";
 import {
   ArrowDownToLine,
@@ -56,7 +62,17 @@ import {
 import { toPng } from "html-to-image";
 import DemoPreview from "./DemoPreview";
 import { useRecorder } from "./useRecorder";
-import { renderVideo } from "./exportVideo";
+import { renderVideo, availableExportFormats } from "./exportVideo";
+import { normalizeTrim } from "./timeline";
+import Modal from "./Modal";
+import { inspectVideo } from "./mediaMetadata";
+import {
+  loadWorkspace,
+  saveWorkspace,
+  storeMedia,
+  loadMedia,
+  saveWorkspaceAndDeleteMedia,
+} from "./projectStorage";
 
 type Design = {
   background: string;
@@ -78,8 +94,15 @@ type Project = {
   source?: string;
   thumbnail?: string;
   sourceAspect?: number;
+  mediaId?: string;
+  mimeType?: string;
+  trimStart?: number;
+  trimEnd?: number;
+  zoomEffect?: boolean;
+  muted?: boolean;
   settings?: Design;
 };
+type Workspace = { version: 2; selectedId: string; projects: Project[] };
 const backgrounds = [
   {
     name: "Sage",
@@ -314,43 +337,6 @@ function MiniPreview({
     </div>
   );
 }
-function Modal({
-  title,
-  subtitle,
-  onClose,
-  children,
-}: {
-  title: string;
-  subtitle?: string;
-  onClose: () => void;
-  children: ReactNode;
-}) {
-  return (
-    <div
-      className="modal-overlay"
-      onMouseDown={(e) => e.target === e.currentTarget && onClose()}
-    >
-      <section
-        className="modal"
-        role="dialog"
-        aria-modal="true"
-        aria-label={title}
-      >
-        <div className="modal-heading">
-          <div>
-            <h2>{title}</h2>
-            {subtitle && <p>{subtitle}</p>}
-          </div>
-          <IconButton label="Close dialog" onClick={onClose}>
-            <X size={19} />
-          </IconButton>
-        </div>
-        {children}
-      </section>
-    </div>
-  );
-}
-
 export default function App() {
   const [projects, setProjects] = useState<Project[]>(() => {
     try {
@@ -383,10 +369,30 @@ export default function App() {
   const [backgroundTab, setBackgroundTab] = useState("Gradient");
   const [leftTab, setLeftTab] = useState("Projects");
   const [modal, setModal] = useState<
-    "record" | "export" | "help" | "new" | null
+    "record" | "export" | "help" | "new" | "delete" | null
   >(null);
   const [toast, setToast] = useState("");
   const [storageLimited, setStorageLimited] = useState(false);
+  const [storageReady, setStorageReady] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<
+    "loading" | "saving" | "saved" | "error"
+  >("loading");
+  const [importing, setImporting] = useState(false);
+  const [libraryOpen, setLibraryOpen] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [trimOpen, setTrimOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const persistenceAllowed = useRef(false);
+  const deletingRef = useRef(false);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const libraryRef = useRef<HTMLElement>(null);
+  const [formats] = useState(() => availableExportFormats());
+  const [exportFormat, setExportFormat] = useState<"webm" | "mp4">(() =>
+    availableExportFormats().includes("mp4") ? "mp4" : "webm",
+  );
+  const dragDepth = useRef(0);
+  const saveRevision = useRef(0);
+  const snapshotRef = useRef<Workspace | null>(null);
   const [query, setQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -396,7 +402,6 @@ export default function App() {
   const [resolution, setResolution] = useState("1080p");
   const [newName, setNewName] = useState("Untitled recording");
   const [zoom, setZoom] = useState(1);
-  const [splits, setSplits] = useState<number[]>([]);
   const [previewSize, setPreviewSize] = useState({ width: 700, height: 430 });
   const [isMuted, setIsMuted] = useState(false);
   const [zoomEffect, setZoomEffect] = useState(true);
@@ -410,8 +415,20 @@ export default function App() {
   const exportAbortRef = useRef<AbortController | null>(null);
   const recorder = useRecorder();
   const duration = project.duration;
-  const activeProjectRef = useRef({ selectedId, design });
-  activeProjectRef.current = { selectedId, design };
+  const minClip = Math.min(0.1, duration);
+  const trimStart = Math.max(
+    0,
+    Math.min(project.trimStart || 0, duration - minClip),
+  );
+  const trimEnd = Math.max(
+    trimStart + minClip,
+    Math.min(project.trimEnd ?? duration, duration),
+  );
+  const trimmedDuration = normalizeTrim(duration, trimStart, trimEnd).duration;
+  const isTrimmed = trimStart > 0.01 || trimEnd < duration - 0.01;
+  const missingMedia = !!project.mediaId && !project.source;
+  const activeProjectRef = useRef({ selectedId, design, isMuted, zoomEffect });
+  activeProjectRef.current = { selectedId, design, isMuted, zoomEffect };
   const recordingSeenRef = useRef<Blob | null>(null);
   const ownedUrlsRef = useRef<string[]>([]);
   useEffect(
@@ -462,23 +479,199 @@ export default function App() {
     }
   }, [toast]);
   useEffect(() => {
-    try {
-      localStorage.setItem(
-        "studio-projects",
-        JSON.stringify(
-          projects
-            .filter((p) => !p.source)
-            .map((p) => ({
-              ...p,
-              settings: p.id === selectedId ? design : p.settings,
-            })),
-        ),
-      );
-      setStorageLimited(false);
-    } catch {
-      setStorageLimited(true);
+    let cancelled = false;
+    const restoredUrls: string[] = [];
+    const restore = async () => {
+      try {
+        let saved = await loadWorkspace<Workspace>();
+        if (saved && (saved.version !== 2 || !Array.isArray(saved.projects)))
+          throw new Error(
+            "Your saved workspace could not be opened. It has been kept safely; reload to try again.",
+          );
+        if (saved?.version === 2 && saved.projects.length === 0) {
+          const fresh = { ...initialProjects[0], id: crypto.randomUUID() };
+          saved = { version: 2, selectedId: fresh.id, projects: [fresh] };
+        }
+        if (
+          saved?.version === 2 &&
+          Array.isArray(saved.projects) &&
+          saved.projects.length
+        ) {
+          const valid = saved.projects.filter(
+            (p) =>
+              typeof p.id === "string" &&
+              typeof p.name === "string" &&
+              Number.isFinite(p.duration) &&
+              p.duration > 0,
+          );
+          if (!valid.length)
+            throw new Error(
+              "Your saved workspace could not be opened. It has been kept safely; reload to try again.",
+            );
+          let missing = 0;
+          const restored = await Promise.all(
+            valid.map(async (p) => {
+              const safe: Project = { ...p, source: undefined };
+              if (p.mediaId) {
+                try {
+                  const blob = await loadMedia(p.mediaId);
+                  if (blob) {
+                    safe.source = URL.createObjectURL(blob);
+                    restoredUrls.push(safe.source);
+                  } else missing++;
+                } catch {
+                  missing++;
+                }
+              }
+              return safe;
+            }),
+          );
+          if (!cancelled && restored.length) {
+            ownedUrlsRef.current.push(...restoredUrls);
+            const selected =
+              restored.find((p) => p.id === saved.selectedId) || restored[0];
+            setProjects(restored);
+            setSelectedId(selected.id);
+            setDesign({
+              ...defaultDesign,
+              background: selected.color,
+              ...selected.settings,
+            });
+            setIsMuted(selected.muted || false);
+            setZoomEffect(selected.zoomEffect ?? true);
+            setTime(selected.trimStart || 0);
+            if (missing)
+              notify(
+                `${missing} saved recording${missing === 1 ? "" : "s"} could not be loaded. Project settings were preserved; try reloading.`,
+              );
+          }
+        }
+        if (!cancelled) {
+          persistenceAllowed.current = true;
+          setStorageLimited(false);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setStorageLimited(true);
+          notify(
+            error instanceof Error
+              ? error.message
+              : "Browser storage is unavailable. Export a backup before closing.",
+          );
+        }
+      } finally {
+        if (cancelled) restoredUrls.forEach((url) => URL.revokeObjectURL(url));
+        else setStorageReady(true);
+      }
+    };
+    void restore();
+    return () => {
+      cancelled = true;
+    };
+  }, [notify]);
+  useEffect(() => {
+    if (!storageReady) return;
+    if (!persistenceAllowed.current) {
+      setSaveStatus("error");
+      return;
     }
-  }, [projects, design, selectedId]);
+    const snapshot: Workspace = {
+      version: 2,
+      selectedId,
+      projects: projects
+        .filter((p) => !p.source || p.mediaId)
+        .map((p) => {
+          const { source: _source, ...metadata } = p;
+          return p.id === selectedId
+            ? { ...metadata, settings: design, muted: isMuted, zoomEffect }
+            : metadata;
+        }),
+    };
+    snapshotRef.current = snapshot;
+    const revision = ++saveRevision.current;
+    setSaveStatus("saving");
+    const timeout = setTimeout(() => {
+      if (deletingRef.current) return;
+      void saveWorkspace(snapshot)
+        .then(() => {
+          if (saveRevision.current === revision) {
+            setSaveStatus("saved");
+            setStorageLimited(false);
+          }
+        })
+        .catch(() => {
+          if (saveRevision.current === revision) {
+            setSaveStatus("error");
+            setStorageLimited(true);
+          }
+        });
+    }, 250);
+    saveTimerRef.current = timeout;
+    return () => clearTimeout(timeout);
+  }, [projects, design, selectedId, isMuted, zoomEffect, storageReady]);
+  useEffect(() => {
+    const flush = () => {
+      if (
+        persistenceAllowed.current &&
+        !deletingRef.current &&
+        snapshotRef.current
+      )
+        void saveWorkspace(snapshotRef.current).catch(() => {});
+    };
+    const hidden = () => {
+      if (document.visibilityState === "hidden") flush();
+    };
+    window.addEventListener("pagehide", flush);
+    document.addEventListener("visibilitychange", hidden);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      document.removeEventListener("visibilitychange", hidden);
+    };
+  }, []);
+  useLayoutEffect(() => {
+    if (!libraryOpen || modal) return;
+    const node = libraryRef.current;
+    if (!node) return;
+    const previous = document.activeElement as HTMLElement | null;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const getFocusables = () =>
+      Array.from(
+        node.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), input, select, [tabindex="0"]',
+        ),
+      ).filter((el) => el.getClientRects().length > 0);
+    getFocusables()[0]?.focus();
+    const key = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        setLibraryOpen(false);
+      } else if (event.key === "Tab") {
+        const elements = getFocusables();
+        const first = elements[0],
+          last = elements[elements.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last?.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first?.focus();
+        }
+      }
+    };
+    const onResize = () => {
+      if (window.innerWidth > 560) setLibraryOpen(false);
+    };
+    document.addEventListener("keydown", key, true);
+    window.addEventListener("resize", onResize);
+    return () => {
+      document.removeEventListener("keydown", key, true);
+      window.removeEventListener("resize", onResize);
+      document.body.style.overflow = previousOverflow;
+      if (previous?.isConnected) previous.focus();
+    };
+  }, [libraryOpen, modal]);
   const updateDesign = useCallback(
     (patch: Partial<Design>) => {
       setPast((prev) => [...prev.slice(-29), design]);
@@ -504,7 +697,12 @@ export default function App() {
     setProjects((items) =>
       items.map((item) =>
         item.id === active.selectedId
-          ? { ...item, settings: active.design }
+          ? {
+              ...item,
+              settings: active.design,
+              muted: active.isMuted,
+              zoomEffect: active.zoomEffect,
+            }
           : item,
       ),
     );
@@ -514,11 +712,15 @@ export default function App() {
         ? active.design
         : p.settings || { ...defaultDesign, background: p.color },
     );
-    setTime(0);
+    setTime(p.trimStart || 0);
+    setIsMuted(p.id === active.selectedId ? active.isMuted : p.muted || false);
+    setZoomEffect(
+      p.id === active.selectedId ? active.zoomEffect : (p.zoomEffect ?? true),
+    );
     setPlaying(false);
+    setLibraryOpen(false);
     setPast([]);
     setFuture([]);
-    setSplits([]);
   }, []);
   const seek = useCallback(
     (newTime: number) => {
@@ -529,9 +731,10 @@ export default function App() {
     [duration],
   );
   const togglePlay = useCallback(() => {
-    if (time >= duration) seek(0);
+    if (missingMedia) return;
+    if (time < trimStart || time >= trimEnd) seek(trimStart);
     setPlaying((p) => !p);
-  }, [duration, time, seek]);
+  }, [trimStart, trimEnd, time, seek, missingMedia]);
   useEffect(() => {
     if (!playing || project.source) return;
     let last = performance.now();
@@ -540,15 +743,15 @@ export default function App() {
       const delta = ((now - last) / 1000) * speed;
       last = now;
       setTime((t) => {
-        if (t + delta >= duration) {
+        if (t + delta >= trimEnd) {
           setPlaying(false);
-          return duration;
+          return trimEnd;
         }
         return t + delta;
       });
     }, 30);
     return () => clearInterval(frame);
-  }, [playing, duration, speed, project.source]);
+  }, [playing, trimEnd, speed, project.source]);
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
@@ -558,6 +761,33 @@ export default function App() {
     if (playing) video.play().catch(() => setPlaying(false));
     else video.pause();
   }, [playing, speed, design.volume, isMuted, project.source]);
+  const updateTrim = useCallback(
+    (start: number, end: number) => {
+      const safeStart = Math.max(0, Math.min(start, duration - minClip));
+      const safeEnd = Math.max(safeStart + minClip, Math.min(end, duration));
+      setProjects((items) =>
+        items.map((p) =>
+          p.id === selectedId
+            ? { ...p, trimStart: safeStart, trimEnd: safeEnd }
+            : p,
+        ),
+      );
+      setPlaying(false);
+    },
+    [duration, minClip, selectedId],
+  );
+  const resetTrim = () => updateTrim(0, duration);
+  const setTrimEdge = (edge: "start" | "end", value: number) => {
+    if (edge === "start") {
+      const next = Math.max(0, Math.min(value, trimEnd - minClip));
+      updateTrim(next, trimEnd);
+      seek(next);
+    } else {
+      const next = Math.max(trimStart + minClip, Math.min(value, duration));
+      updateTrim(trimStart, next);
+      seek(next);
+    }
+  };
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
       if (
@@ -567,17 +797,33 @@ export default function App() {
       )
         return;
       if (event.code === "Escape") {
-        if (!exporting) setModal(null);
         setMenuOpen(false);
+        setLibraryOpen(false);
       }
-      if (modal) return;
+      if (modal || libraryOpen || !storageReady || importing || deleting)
+        return;
+      if ((event.target as HTMLElement).isContentEditable) return;
+      if (
+        !event.metaKey &&
+        !event.ctrlKey &&
+        ["i", "o"].includes(event.key.toLowerCase())
+      ) {
+        event.preventDefault();
+        setTrimOpen(true);
+        if (event.key.toLowerCase() === "i")
+          updateTrim(Math.min(time, trimEnd - minClip), trimEnd);
+        else updateTrim(trimStart, Math.max(time, trimStart + minClip));
+      }
       if (event.key.toLowerCase() === "n" && !event.metaKey && !event.ctrlKey)
         setModal("record");
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "i") {
         event.preventDefault();
         fileRef.current?.click();
       }
-      if (event.code === "Space") {
+      if (
+        event.code === "Space" &&
+        (event.target as HTMLElement).tagName !== "BUTTON"
+      ) {
         event.preventDefault();
         togglePlay();
       }
@@ -594,115 +840,150 @@ export default function App() {
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [modal, togglePlay, seek, time, undo, redo, exporting]);
+  }, [
+    modal,
+    togglePlay,
+    seek,
+    time,
+    undo,
+    redo,
+    storageReady,
+    libraryOpen,
+    importing,
+    deleting,
+    updateTrim,
+    trimStart,
+    trimEnd,
+    minClip,
+  ]);
   useEffect(() => {
     if (recorder.error) notify(recorder.error);
   }, [recorder.error, notify]);
+  const addVideo = useCallback(
+    async (blob: Blob, name: string, knownDuration?: number) => {
+      setImporting(true);
+      try {
+        const metadata = await inspectVideo(blob, knownDuration);
+        let mediaId: string | undefined;
+        try {
+          mediaId = await storeMedia(blob);
+        } catch (error) {
+          setStorageLimited(true);
+          notify(
+            error instanceof Error
+              ? error.message
+              : "This recording is available for this session only. Export a backup.",
+          );
+        }
+        const url = URL.createObjectURL(blob);
+        ownedUrlsRef.current.push(url);
+        const item: Project = {
+          id: crypto.randomUUID(),
+          name,
+          duration: metadata.duration,
+          color: backgrounds[0].value,
+          source: url,
+          sourceAspect: metadata.aspect,
+          thumbnail: metadata.thumbnail,
+          mediaId,
+          mimeType: blob.type,
+        };
+        setProjects((items) => [item, ...items]);
+        chooseProject(item);
+        setModal(null);
+        if (mediaId) notify("Video ready. Saved privately in this browser.");
+      } catch (error) {
+        notify(
+          error instanceof Error
+            ? error.message
+            : "This video could not be opened. Try MP4 or WebM.",
+        );
+      } finally {
+        setImporting(false);
+      }
+    },
+    [chooseProject, notify],
+  );
   useEffect(() => {
-    if (
-      !recorder.recording ||
-      recordingSeenRef.current === recorder.recording.blob
-    )
-      return;
     const rec = recorder.recording;
+    if (!rec || recordingSeenRef.current === rec.blob) return;
     recordingSeenRef.current = rec.blob;
-    const url = URL.createObjectURL(rec.blob);
-    ownedUrlsRef.current.push(url);
-    const item: Project = {
-      id: `recording-${Date.now()}`,
-      name: "New screen recording",
-      duration: rec.duration || 1,
-      color: backgrounds[0].value,
-      source: url,
-      sourceAspect: 16 / 9,
-    };
-    setProjects((p) => [item, ...p]);
-    chooseProject(item);
-    setModal(null);
-    notify("Your recording is ready. Make it your own.");
-  }, [recorder.recording, notify, chooseProject]);
+    void addVideo(rec.blob, "New screen recording", rec.duration);
+  }, [recorder.recording, addVideo]);
   const importVideo = async (file?: File) => {
-    if (!file) return;
-    if (!file.type.startsWith("video/")) {
+    if (!file || importing) return;
+    if (
+      !file.type.startsWith("video/") &&
+      !/\.(mp4|webm|mov|m4v|ogv)$/i.test(file.name)
+    ) {
       notify("Choose a video file, such as MP4, MOV, or WebM.");
       return;
     }
-    const url = URL.createObjectURL(file);
-    const video = document.createElement("video");
-    video.preload = "auto";
-    video.src = url;
-    const failed = () => {
-      URL.revokeObjectURL(url);
-      notify("This video could not be opened. Try MP4 or WebM.");
+    await addVideo(file, file.name.replace(/\.[^.]+$/, ""));
+  };
+  const removeProject = async () => {
+    if (deletingRef.current) return;
+    const removed = project;
+    const remaining = projects.filter((p) => p.id !== selectedId);
+    const next = remaining.length
+      ? remaining
+      : [{ ...initialProjects[0], id: crypto.randomUUID() }];
+    const snapshot: Workspace = {
+      version: 2,
+      selectedId: next[0].id,
+      projects: next
+        .filter((p) => !p.source || p.mediaId)
+        .map((p) => {
+          const { source: _source, ...metadata } = p;
+          return metadata;
+        }),
     };
-    video.onerror = failed;
-    video.onloadedmetadata = async () => {
-      let measuredDuration = video.duration;
-      if (!Number.isFinite(measuredDuration)) {
-        try {
-          measuredDuration = await new Promise<number>((resolve, reject) => {
-            const timeout = setTimeout(
-              () => reject(new Error("duration")),
-              10000,
-            );
-            video.onseeked = () => {
-              clearTimeout(timeout);
-              video.onseeked = null;
-              const total = Number.isFinite(video.duration)
-                ? video.duration
-                : video.currentTime;
-              total > 0 && Number.isFinite(total)
-                ? resolve(total)
-                : reject(new Error("duration"));
-            };
-            video.currentTime = 1e10;
-          });
-        } catch {
-          failed();
-          return;
-        }
-      }
-      if (!measuredDuration || measuredDuration <= 0) {
-        failed();
-        return;
-      }
-      let thumbnail: string | undefined;
-      try {
-        video.currentTime = 0;
-        await new Promise<void>((resolve) => {
-          if (video.readyState >= 2 && !video.seeking) resolve();
-          else {
-            video.onseeked = () => resolve();
-            setTimeout(resolve, 800);
-          }
-        });
-        const canvas = document.createElement("canvas");
-        canvas.width = 320;
-        canvas.height = Math.round(
-          (320 * video.videoHeight) / video.videoWidth,
+    const deleteId =
+      removed.mediaId && !remaining.some((p) => p.mediaId === removed.mediaId)
+        ? removed.mediaId
+        : undefined;
+    deletingRef.current = true;
+    setDeleting(true);
+    ++saveRevision.current;
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    try {
+      if (!persistenceAllowed.current)
+        throw new Error(
+          "Browser storage is unavailable. Reload before deleting saved projects.",
         );
-        canvas
-          .getContext("2d")
-          ?.drawImage(video, 0, 0, canvas.width, canvas.height);
-        thumbnail = canvas.toDataURL("image/jpeg", 0.7);
-      } catch {
-        /* Thumbnail is optional. */
-      }
-      const item: Project = {
-        id: `import-${Date.now()}`,
-        name: file.name.replace(/\.[^.]+$/, ""),
-        duration: measuredDuration,
-        color: backgrounds[0].value,
-        source: url,
-        sourceAspect: video.videoWidth / video.videoHeight,
-        thumbnail,
-      };
-      ownedUrlsRef.current.push(url);
-      setProjects((p) => [item, ...p]);
-      chooseProject(item);
+      await saveWorkspaceAndDeleteMedia(snapshot, deleteId);
+      snapshotRef.current = snapshot;
+      setProjects(next);
+      chooseProject(next[0]);
       setModal(null);
-      notify("Video imported. Ready for a little polish.");
-    };
+      setMenuOpen(false);
+      if (removed.source && !remaining.some((p) => p.source === removed.source))
+        URL.revokeObjectURL(removed.source);
+      notify("Project deleted");
+    } catch (error) {
+      setSaveStatus("error");
+      setStorageLimited(true);
+      notify(
+        error instanceof Error
+          ? error.message
+          : "The project could not be deleted. Your recording is safe.",
+      );
+    } finally {
+      deletingRef.current = false;
+      setDeleting(false);
+    }
+  };
+  const downloadOriginal = () => {
+    if (!project.source) return;
+    const anchor = document.createElement("a");
+    anchor.href = project.source;
+    const extension = project.mimeType?.includes("mp4")
+      ? "mp4"
+      : project.mimeType?.includes("quicktime")
+        ? "mov"
+        : "webm";
+    anchor.download = `${project.name || "recording"}-original.${extension}`;
+    anchor.click();
   };
   const duplicateProject = () => {
     const copy = {
@@ -710,6 +991,8 @@ export default function App() {
       id: `copy-${Date.now()}`,
       name: `${project.name} copy`,
       settings: design,
+      muted: isMuted,
+      zoomEffect,
     };
     setProjects((p) => [...p, copy]);
     setMenuOpen(false);
@@ -729,10 +1012,11 @@ export default function App() {
     notify("New project created with the studio demo");
   };
   const startExport = async () => {
+    if (exporting || missingMedia || !formats.length) return;
     setPlaying(false);
     setExporting(true);
     setExportProgress(0);
-    seek(0);
+    seek(trimStart);
     const controller = new AbortController();
     exportAbortRef.current = controller;
     try {
@@ -750,6 +1034,9 @@ export default function App() {
         sourceUrl: project.source,
         demoImageUrl,
         duration,
+        trimStart,
+        trimEnd,
+        format: exportFormat,
         background: design.background,
         padding: design.padding,
         borderRadius: design.radius,
@@ -770,7 +1057,7 @@ export default function App() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `${project.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.webm`;
+      a.download = `${project.name.toLowerCase().replace(/[^a-z0-9]+/g, "-") || "screen-recording"}.${exportFormat}`;
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 10000);
       setModal(null);
@@ -789,24 +1076,52 @@ export default function App() {
       }
     }
   };
-  const splitClip = () => {
-    if (time < 0.2 || time > duration - 0.2) {
-      notify("Move the playhead inside the clip to split it.");
-      return;
-    }
-    if (!splits.some((s) => Math.abs(s - time) < 0.2)) {
-      setSplits((p) => [...p, time].sort((a, b) => a - b));
-      notify(`Clip split at ${formatTime(time, true)}`);
-    }
-  };
+  useEffect(() => {
+    if (modal) setLibraryOpen(false);
+  }, [modal]);
   const currentBackground =
     backgrounds.find((b) => b.value === design.background)?.name ||
     wallpapers.find((b) => design.background.includes(b.url))?.name ||
     "Custom";
 
   return (
-    <div className="studio-app">
+    <div
+      className="studio-app"
+      onDragEnter={(e) => {
+        if (Array.from(e.dataTransfer.types).includes("Files")) {
+          e.preventDefault();
+          dragDepth.current++;
+          setDragging(true);
+        }
+      }}
+      onDragOver={(e) => {
+        if (Array.from(e.dataTransfer.types).includes("Files")) {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "copy";
+        }
+      }}
+      onDragLeave={(e) => {
+        e.preventDefault();
+        dragDepth.current = Math.max(0, dragDepth.current - 1);
+        if (!dragDepth.current) setDragging(false);
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        dragDepth.current = 0;
+        setDragging(false);
+        if (!modal && !importing) void importVideo(e.dataTransfer.files[0]);
+      }}
+    >
       <header className="app-header">
+        <button
+          className="mobile-library-button"
+          aria-label="Open project library"
+          data-dialog-focus-fallback
+          aria-expanded={libraryOpen}
+          onClick={() => setLibraryOpen(true)}
+        >
+          <Layers size={19} />
+        </button>
         <a
           href="#"
           className="brand"
@@ -860,17 +1175,21 @@ export default function App() {
                     <Plus size={15} />
                     New project
                   </button>
+                  {project.source && (
+                    <button
+                      onClick={() => {
+                        downloadOriginal();
+                        setMenuOpen(false);
+                      }}
+                    >
+                      <ArrowDownToLine size={15} />
+                      Download original
+                    </button>
+                  )}
                   <button
                     onClick={() => {
-                      if (projects.length > 1) {
-                        const rest = projects.filter(
-                          (p) => p.id !== selectedId,
-                        );
-                        setProjects(rest);
-                        chooseProject(rest[0]);
-                      } else
-                        notify("Keep at least one project in your workspace.");
                       setMenuOpen(false);
+                      setModal("delete");
                     }}
                   >
                     <Trash2 size={15} />
@@ -880,11 +1199,26 @@ export default function App() {
               )}
             </div>
           </div>
-          <span className="saved-status">
-            <CheckCheck size={13} />{" "}
-            {project.source || storageLimited
-              ? "Saved for this session"
-              : "All changes saved"}
+          <span
+            className={`saved-status ${storageLimited || (project.source && !project.mediaId) ? "save-warning" : ""}`}
+            title="Your projects and recordings are stored on this device, not uploaded."
+          >
+            {saveStatus === "saving" || !storageReady ? (
+              <LoaderCircle size={12} className="spin" />
+            ) : (
+              <CheckCheck size={13} />
+            )}
+            {!storageReady
+              ? "Opening workspace…"
+              : importing
+                ? "Saving video…"
+                : project.source && !project.mediaId
+                  ? "Session only · export a backup"
+                  : storageLimited
+                    ? "Could not save · export a backup"
+                    : saveStatus === "saving"
+                      ? "Saving changes…"
+                      : "Saved on this device"}
           </span>
         </div>
         <div className="header-actions">
@@ -897,6 +1231,14 @@ export default function App() {
           </button>
           <button
             className="button button-primary"
+            disabled={missingMedia || !formats.length}
+            title={
+              missingMedia
+                ? "Reload to restore the missing recording"
+                : !formats.length
+                  ? "Video export is unavailable in this browser"
+                  : undefined
+            }
             onClick={() => setModal("export")}
           >
             <ArrowUpRight size={16} />
@@ -905,7 +1247,29 @@ export default function App() {
         </div>
       </header>
 
-      <aside className="left-sidebar">
+      {libraryOpen && (
+        <button
+          className="library-backdrop"
+          aria-label="Close project library"
+          onClick={() => setLibraryOpen(false)}
+        />
+      )}
+      <aside
+        ref={libraryRef}
+        className={`left-sidebar ${libraryOpen ? "library-open" : ""}`}
+        role={libraryOpen ? "dialog" : undefined}
+        aria-modal={libraryOpen || undefined}
+        aria-label={libraryOpen ? "Project library" : undefined}
+      >
+        <div className="mobile-library-heading">
+          <strong>Your workspace</strong>
+          <IconButton
+            label="Close project library"
+            onClick={() => setLibraryOpen(false)}
+          >
+            <X size={18} />
+          </IconButton>
+        </div>
         <div className="workspace-label">
           <span>MY WORKSPACE</span>
           <span className="workspace-count">{projects.length}</span>
@@ -965,7 +1329,7 @@ export default function App() {
           {projects
             .filter(
               (p) =>
-                (leftTab === "Projects" || p.source) &&
+                (leftTab === "Projects" || p.source || p.mediaId) &&
                 p.name.toLowerCase().includes(query.toLowerCase()),
             )
             .map((p, index) => (
@@ -1003,7 +1367,7 @@ export default function App() {
                           ? "Yesterday"
                           : "2 days ago"}
                   </span>
-                  <span>{p.source ? "VIDEO" : "DEMO"}</span>
+                  <span>{p.source || p.mediaId ? "VIDEO" : "DEMO"}</span>
                 </div>
               </button>
             ))}
@@ -1055,7 +1419,11 @@ export default function App() {
               <Monitor size={15} />
               <span>Preview</span>
               <span className="demo-label">
-                {project.source ? "Recording" : "Demo project"}
+                {missingMedia
+                  ? "Recording unavailable"
+                  : project.source
+                    ? "Recording"
+                    : "Demo project"}
               </span>
             </div>
             <div className="preview-toolbar-right">
@@ -1109,7 +1477,9 @@ export default function App() {
                   borderRadius: `${design.radius}px`,
                   boxShadow: `0 ${design.shadow * 0.22}px ${design.shadow * 0.65}px ${design.shadow * 0.03}px rgba(0, 0, 0, ${design.shadow / 150})`,
                   transform:
-                    zoomEffect && time > duration / 3 && time < duration * 0.56
+                    zoomEffect &&
+                    time - trimStart > trimmedDuration / 3 &&
+                    time - trimStart < trimmedDuration * 0.56
                       ? "scale(1.12)"
                       : "scale(1)",
                 }}
@@ -1122,6 +1492,7 @@ export default function App() {
                     playsInline
                     onLoadedMetadata={(e) => {
                       const v = e.currentTarget;
+                      v.currentTime = trimStart;
                       setProjects((items) =>
                         items.map((p) =>
                           p.id === selectedId
@@ -1133,9 +1504,29 @@ export default function App() {
                         ),
                       );
                     }}
-                    onTimeUpdate={(e) => setTime(e.currentTarget.currentTime)}
+                    onTimeUpdate={(e) => {
+                      const v = e.currentTarget;
+                      if (playing && v.currentTime >= trimEnd) {
+                        v.pause();
+                        v.currentTime = trimEnd;
+                        setPlaying(false);
+                        setTime(trimEnd);
+                      } else setTime(v.currentTime);
+                    }}
                     onEnded={() => setPlaying(false)}
                   />
+                ) : missingMedia ? (
+                  <div className="missing-media">
+                    <Film size={28} />
+                    <strong>Recording unavailable</strong>
+                    <p>The saved video was removed from this browser.</p>
+                    <button
+                      className="button"
+                      onClick={() => fileRef.current?.click()}
+                    >
+                      Import a video
+                    </button>
+                  </div>
                 ) : (
                   <div ref={demoRef} className="demo-holder">
                     <DemoPreview
@@ -1148,6 +1539,17 @@ export default function App() {
               </div>
             </div>
           </div>
+          <input
+            className="preview-scrubber"
+            aria-label="Playback position"
+            type="range"
+            min="0"
+            max={duration}
+            step="0.01"
+            value={time}
+            onChange={(e) => seek(Number(e.target.value))}
+            style={{ "--fill": `${(time / duration) * 100}%` } as CSSProperties}
+          />
           <div className="playback-bar">
             <div className="video-meta">
               <span className="quality-dot" />
@@ -1161,12 +1563,16 @@ export default function App() {
               <span className="meta-separator">·</span>30 fps
             </div>
             <div className="playback-controls">
-              <IconButton label="Go to beginning" onClick={() => seek(0)}>
+              <IconButton
+                label="Go to beginning"
+                onClick={() => seek(trimStart)}
+              >
                 <SkipBack size={15} fill="currentColor" />
               </IconButton>
               <IconButton
                 label={playing ? "Pause" : "Play"}
                 className="play-button"
+                disabled={missingMedia}
                 onClick={togglePlay}
               >
                 {playing ? (
@@ -1178,14 +1584,17 @@ export default function App() {
               <IconButton
                 label="Go to end"
                 onClick={() => {
-                  seek(duration);
+                  seek(trimEnd);
                   setPlaying(false);
                 }}
               >
                 <SkipForward size={15} fill="currentColor" />
               </IconButton>
               <span className="time-display">
-                {formatTime(time)} <span>/ {formatTime(duration)}</span>
+                {formatTime(
+                  Math.max(0, Math.min(time - trimStart, trimmedDuration)),
+                )}{" "}
+                <span>/ {formatTime(trimmedDuration)}</span>
               </span>
             </div>
             <button
@@ -1202,7 +1611,7 @@ export default function App() {
           </div>
         </div>
 
-        <section className="timeline">
+        <section className={`timeline ${trimOpen ? "trimming" : ""}`}>
           <div className="timeline-toolbar">
             <div className="timeline-tools">
               <IconButton
@@ -1220,18 +1629,21 @@ export default function App() {
                 <Redo2 size={16} />
               </IconButton>
               <span className="toolbar-divider" />
-              <IconButton label="Split clip at playhead" onClick={splitClip}>
-                <Scissors size={16} />
-              </IconButton>
-              <IconButton
-                label="Clear clip splits"
-                onClick={() => {
-                  setSplits([]);
-                  notify("Clip splits cleared");
-                }}
-                disabled={!splits.length}
+              <button
+                className={`trim-tool ${trimOpen ? "active" : ""}`}
+                aria-label="Trim video"
+                aria-expanded={trimOpen}
+                onClick={() => setTrimOpen(!trimOpen)}
               >
-                <Trash2 size={15} />
+                <Scissors size={14} />
+                <span>Trim</span>
+              </button>
+              <IconButton
+                label="Reset trim"
+                onClick={resetTrim}
+                disabled={!isTrimmed}
+              >
+                <RotateCcw size={14} />
               </IconButton>
               <span className="toolbar-divider" />
               <button
@@ -1271,6 +1683,57 @@ export default function App() {
               </button>
             </div>
           </div>
+          {trimOpen && (
+            <div className="trim-panel">
+              <label>
+                In{" "}
+                <input
+                  aria-label="Trim start seconds"
+                  type="number"
+                  min="0"
+                  max={trimEnd - minClip}
+                  step="0.1"
+                  value={Number(trimStart.toFixed(2))}
+                  onChange={(e) => setTrimEdge("start", Number(e.target.value))}
+                />
+                <span>s</span>
+              </label>
+              <button
+                className="set-trim-button"
+                title="Set start at playhead (I)"
+                aria-label="Set trim start at playhead"
+                onClick={() => setTrimEdge("start", time)}
+              >
+                Set in <kbd>I</kbd>
+              </button>
+              <span className="trim-panel-divider" />
+              <label>
+                Out{" "}
+                <input
+                  aria-label="Trim end seconds"
+                  type="number"
+                  min={trimStart + minClip}
+                  max={duration}
+                  step="0.1"
+                  value={Number(trimEnd.toFixed(2))}
+                  onChange={(e) => setTrimEdge("end", Number(e.target.value))}
+                />
+                <span>s</span>
+              </label>
+              <button
+                className="set-trim-button"
+                title="Set end at playhead (O)"
+                aria-label="Set trim end at playhead"
+                onClick={() => setTrimEdge("end", time)}
+              >
+                Set out <kbd>O</kbd>
+              </button>
+              <span className="trim-duration">
+                <Clock3 size={12} />
+                {formatTime(trimmedDuration, true)}
+              </span>
+            </div>
+          )}
           <div className="timeline-body">
             <div className="track-labels">
               <div className="ruler-label">
@@ -1347,14 +1810,88 @@ export default function App() {
                       />
                     ))}
                   </div>
-                  <span className="trim-handle left" />
-                  <span className="trim-handle right" />
-                  {splits.map((split) => (
-                    <div
-                      className="clip-split"
-                      key={split}
-                      style={{ left: `${(split / duration) * 100}%` }}
-                    />
+                  <div
+                    className="trim-mask trim-mask-start"
+                    style={{ width: `${(trimStart / duration) * 100}%` }}
+                  />
+                  <div
+                    className="trim-mask trim-mask-end"
+                    style={{ width: `${(1 - trimEnd / duration) * 100}%` }}
+                  />
+                  <div
+                    className="trim-selection"
+                    style={{
+                      left: `${(trimStart / duration) * 100}%`,
+                      width: `${(trimmedDuration / duration) * 100}%`,
+                    }}
+                  />
+                  {(["start", "end"] as const).map((edge) => (
+                    <button
+                      key={edge}
+                      className={`trim-grip trim-grip-${edge}`}
+                      role="slider"
+                      aria-label={`Trim ${edge}`}
+                      aria-valuemin={edge === "start" ? 0 : trimStart + minClip}
+                      aria-valuemax={
+                        edge === "start" ? trimEnd - minClip : duration
+                      }
+                      aria-valuenow={edge === "start" ? trimStart : trimEnd}
+                      aria-valuetext={formatTime(
+                        edge === "start" ? trimStart : trimEnd,
+                        true,
+                      )}
+                      style={{
+                        left: `${((edge === "start" ? trimStart : trimEnd) / duration) * 100}%`,
+                      }}
+                      onClick={(e) => e.stopPropagation()}
+                      onPointerDown={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        e.currentTarget.setPointerCapture(e.pointerId);
+                        setTrimOpen(true);
+                        setPlaying(false);
+                      }}
+                      onPointerMove={(e) => {
+                        if (!e.currentTarget.hasPointerCapture(e.pointerId))
+                          return;
+                        const rect =
+                          timelineRef.current?.getBoundingClientRect();
+                        if (rect)
+                          setTrimEdge(
+                            edge,
+                            ((e.clientX - rect.left) / rect.width) * duration,
+                          );
+                      }}
+                      onPointerUp={(e) => {
+                        if (e.currentTarget.hasPointerCapture(e.pointerId))
+                          e.currentTarget.releasePointerCapture(e.pointerId);
+                      }}
+                      onKeyDown={(e) => {
+                        if (
+                          ["ArrowLeft", "ArrowRight", "Home", "End"].includes(
+                            e.key,
+                          )
+                        ) {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          const current =
+                            edge === "start" ? trimStart : trimEnd;
+                          setTrimEdge(
+                            edge,
+                            e.key === "Home"
+                              ? 0
+                              : e.key === "End"
+                                ? duration
+                                : current +
+                                  (e.key === "ArrowRight" ? 1 : -1) *
+                                    (e.shiftKey ? 1 : 0.1),
+                          );
+                        }
+                      }}
+                    >
+                      <i />
+                      <i />
+                    </button>
                   ))}
                 </div>
                 <div
@@ -1382,7 +1919,10 @@ export default function App() {
                   {zoomEffect && (
                     <div
                       className="zoom-clip"
-                      style={{ left: "33%", width: "23%" }}
+                      style={{
+                        left: `${((trimStart + trimmedDuration / 3) / duration) * 100}%`,
+                        width: `${((trimmedDuration * 0.227) / duration) * 100}%`,
+                      }}
                     >
                       <ZoomIn size={10} />
                       <span>1.12× zoom</span>
@@ -1402,9 +1942,9 @@ export default function App() {
           <div className="timeline-footer">
             <span>
               <span className="timeline-status-dot" />
-              {splits.length + 1} clip{splits.length > 0 ? "s" : ""}
+              {isTrimmed ? "Trimmed selection" : "Full clip"}
               <span className="meta-separator">·</span>
-              {formatTime(duration)} total
+              {formatTime(trimmedDuration)} to export
             </span>
             <span>
               <span className="space-key">space</span> to play or pause
@@ -1433,6 +1973,55 @@ export default function App() {
         <div className="inspector-content">
           {inspector === "Design" ? (
             <>
+              <section className="quick-looks">
+                <div className="quick-looks-heading">
+                  <Sparkles size={13} />
+                  <span>Quick looks</span>
+                  <span>One click. All set.</span>
+                </div>
+                <div className="quick-look-grid">
+                  {[
+                    {
+                      name: "Studio",
+                      background: backgrounds[0].value,
+                      padding: 56,
+                      radius: 12,
+                      shadow: 55,
+                    },
+                    {
+                      name: "Focus",
+                      background: backgrounds[5].value,
+                      padding: 30,
+                      radius: 6,
+                      shadow: 35,
+                    },
+                    {
+                      name: "Airy",
+                      background: "#eeeae2",
+                      padding: 90,
+                      radius: 18,
+                      shadow: 32,
+                    },
+                  ].map((preset) => (
+                    <button
+                      key={preset.name}
+                      aria-label={`Apply ${preset.name} preset`}
+                      onClick={() => {
+                        const { name: _name, ...values } = preset;
+                        updateDesign(values);
+                      }}
+                    >
+                      <span
+                        className="quick-look-preview"
+                        style={{ background: preset.background }}
+                      >
+                        <i style={{ borderRadius: preset.radius / 5 }} />
+                      </span>
+                      <span>{preset.name}</span>
+                    </button>
+                  ))}
+                </div>
+              </section>
               <section className="setting-section background-section">
                 <div className="section-heading">
                   <div>
@@ -1723,7 +2312,7 @@ export default function App() {
           <span className="online-dot" />
           All systems ready
           <span className="footer-divider" />
-          Screen Studio <span className="version">1.0</span>
+          Screen Studio <span className="version">1.1</span>
         </span>
       </footer>
 
@@ -1864,7 +2453,7 @@ export default function App() {
             <div>
               <strong>{project.name}</strong>
               <span>
-                {formatTime(duration)} · {design.aspect} · 30 fps
+                {formatTime(trimmedDuration, true)} · {design.aspect} · 30 fps
               </span>
             </div>
           </div>
@@ -1880,6 +2469,13 @@ export default function App() {
             </div>
           ) : (
             <>
+              {(missingMedia || !formats.length) && (
+                <p className="modal-info">
+                  {missingMedia
+                    ? "The original recording could not be loaded. Reload to try restoring it before exporting."
+                    : "This browser does not support video export. Open this project in a supported desktop browser."}
+                </p>
+              )}
               <label className="export-field">
                 Resolution
                 <select
@@ -1890,20 +2486,41 @@ export default function App() {
                   <option value="720p">720p · Smaller file</option>
                 </select>
               </label>
-              <div className="export-field">
-                <span>Format</span>
-                <span className="format-pill">
-                  WebM <span>High quality</span>
-                </span>
-              </div>
+              <label className="export-field">
+                Format
+                <select
+                  aria-label="Export format"
+                  value={exportFormat}
+                  onChange={(e) =>
+                    setExportFormat(e.target.value as "webm" | "mp4")
+                  }
+                >
+                  {formats.map((format) => (
+                    <option key={format} value={format}>
+                      {format === "mp4" ? "MP4" : "WebM · High quality"}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {isTrimmed && (
+                <div className="export-trim-summary">
+                  <Scissors size={14} />
+                  <span>
+                    {formatTime(trimStart, true)} → {formatTime(trimEnd, true)}
+                  </span>
+                  <b>{formatTime(trimmedDuration, true)} selected</b>
+                </div>
+              )}
               <div className="modal-info">
                 <Layers size={15} />
-                Includes your background, padding, rounded corners, and shadow.
+                Includes your selected trim, background, frame styling, audio,
+                and zoom effects.
               </div>
             </>
           )}
           <button
             className={`button ${exporting ? "" : "button-primary"} modal-primary`}
+            disabled={!exporting && (missingMedia || !formats.length)}
             onClick={
               exporting
                 ? () => {
@@ -1938,7 +2555,12 @@ export default function App() {
               autoFocus
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && createProject()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  createProject();
+                }
+              }}
             />
           </label>
           <button
@@ -1982,6 +2604,9 @@ export default function App() {
               ["Skip 5 seconds", "← / →"],
               ["Undo", "⌘ / Ctrl Z"],
               ["Redo", "⌘ / Ctrl ⇧ Z"],
+              ["Set trim start / end", "I / O"],
+              ["Import video", "⌘ / Ctrl I"],
+              ["New recording", "N"],
               ["Export video", "⌘ / Ctrl E"],
             ].map(([label, key]) => (
               <div key={label}>
@@ -1991,8 +2616,9 @@ export default function App() {
             ))}
           </div>
           <p className="help-note">
-            Demo projects and design settings are saved in this browser.
-            Download your recorded and imported videos before closing the tab.
+            Projects, imported videos, and recordings are saved privately in
+            this browser, including your trim and design settings. Clearing site
+            data removes them, so export a backup of anything important.
           </p>
           <button
             className="button button-primary modal-primary"
@@ -2002,6 +2628,55 @@ export default function App() {
             <ArrowRight size={15} />
           </button>
         </Modal>
+      )}
+      {modal === "delete" && (
+        <Modal
+          title="Delete this project?"
+          subtitle={project.name}
+          onClose={() => {
+            if (!deleting) setModal(null);
+          }}
+          closeDisabled={deleting}
+        >
+          <p className="delete-project-copy">
+            This removes the project and its saved recording from this browser.
+            Export a copy first if you want to keep it.
+          </p>
+          <div className="delete-project-actions">
+            <button
+              className="button"
+              disabled={deleting}
+              onClick={() => setModal(null)}
+            >
+              Keep project
+            </button>
+            <button
+              className="button button-danger"
+              disabled={deleting}
+              onClick={() => void removeProject()}
+            >
+              <Trash2 size={15} />
+              Delete project
+            </button>
+          </div>
+        </Modal>
+      )}
+      {dragging && (
+        <div className="drop-overlay">
+          <div>
+            <Upload size={35} />
+            <h2>Drop it like it’s your next great take.</h2>
+            <p>MP4, WebM, or MOV · processed on your device</p>
+          </div>
+        </div>
+      )}
+      {(!storageReady || importing) && (
+        <div className="workspace-busy" role="status">
+          <LoaderCircle size={22} className="spin" />
+          <span>
+            {importing ? "Preparing your video…" : "Opening your workspace…"}
+          </span>
+        </div>
       )}
     </div>
   );
