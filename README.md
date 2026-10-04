@@ -1,4 +1,4 @@
-# Screen Studio — browser workspace
+# screen-recorder-workspace
 
 A Screen Studio-inspired recorder and video editor built with React, TypeScript, and Vite. No account or backend is required.
 
